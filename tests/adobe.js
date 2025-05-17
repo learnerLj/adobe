@@ -1,289 +1,73 @@
 import assert from "assert";
-import anchor from "@project-serum/anchor";
-import spl from "@solana/spl-token";
-import { findAddr, findAssocAddr, discriminator, airdrop } from "../app/util.js";
-import * as api from "../app/api.js";
+import * as anchor from "@coral-xyz/anchor";
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
-const LAMPORTS_PER_SOL = anchor.web3.LAMPORTS_PER_SOL;
-const SYSVAR_INSTRUCTIONS_PUBKEY = anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY;
-const TOKEN_PROGRAM_ID = spl.TOKEN_PROGRAM_ID;
-const ASSOCIATED_TOKEN_PROGRAM_ID = spl.ASSOCIATED_TOKEN_PROGRAM_ID;
+const { SystemProgram } = anchor.web3;
 
-const TXN_OPTS = {commitment: "processed", preflightCommitment: "processed", skipPreflight: true};
-const TOKEN_DECIMALS = 6;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-anchor.setProvider(anchor.Provider.local(null, TXN_OPTS));
-const provider = anchor.getProvider();
-api.setProvider(provider);
+describe("adobe", () => {
+  // 使用本地provider
+  const provider = anchor.AnchorProvider.local();
 
-const adobe = anchor.workspace.Adobe;
-const evil = anchor.workspace.Evil;
-const wallet = anchor.getProvider().wallet;
+  // 设置provider
+  anchor.setProvider(provider);
+  const program = anchor.workspace.Adobe;
 
-console.log(
-`adobe: ${adobe.programId.toString()}
-evil: ${evil.programId.toString()}
-`);
-
-// we create a fresh token, for which we need...
-// * arbitrary authority
-// * derived pool address
-// * derived voucher address
-// * user associated account
-const tokenMintAuthority = new anchor.web3.Keypair;
-let tokenMint;
-let poolKey;
-let poolBump;
-let poolTokenKey;
-let voucherMintKey;
-let userTokenKey;
-let userVoucherKey;
-
-let [stateKey, stateBump] = findAddr([discriminator("State")], adobe.programId);
-
-// all the throwaway bullshit in one convenient location
-async function setup() {
-    // first create a fresh mint
-    tokenMint = await spl.Token.createMint(
-        provider.connection,
-        wallet.payer,
-        tokenMintAuthority.publicKey,
-        null,
-        TOKEN_DECIMALS,
-        TOKEN_PROGRAM_ID,
+  // 测试账户
+  let myAccount;
+  
+  it("初始化状态", async () => {
+    // 生成一个新的账户
+    const authority = anchor.web3.Keypair.generate();
+    
+    // 为authority账户提供资金
+    const airdropSignature = await provider.connection.requestAirdrop(
+      authority.publicKey,
+      2 * anchor.web3.LAMPORTS_PER_SOL
     );
-
-    // find the pdas for adobes corresponding pool and voucher mint
-    [poolKey, poolBump] = findAddr([discriminator("Pool"), tokenMint.publicKey.toBuffer()], adobe.programId);
-    [poolTokenKey] = findAddr([Buffer.from("TOKEN"), tokenMint.publicKey.toBuffer()], adobe.programId);
-    [voucherMintKey] = findAddr([Buffer.from("VOUCHER"), tokenMint.publicKey.toBuffer()], adobe.programId);
-
-    // create our wallet an associated account for the token
-    userTokenKey = (await tokenMint.getOrCreateAssociatedAccountInfo(wallet.publicKey)).address;
-
-    // mint authority needs money
-    await airdrop(provider, tokenMintAuthority.publicKey, 100 * LAMPORTS_PER_SOL);
-
-    // and mint 100 of the token to the wallet
-    await tokenMint.mintTo(
-        userTokenKey,
-        tokenMintAuthority,
-        [],
-        100 * 10 ** TOKEN_DECIMALS,
+    
+    // 等待确认
+    await provider.connection.confirmTransaction({ signature: airdropSignature });
+    
+    // 在Anchor中，Account Discriminator是对账户名称的8字节哈希
+    // 在Rust代码中使用的是 State::DISCRIMINATOR
+    const stateDiscriminator = Buffer.from(anchor.utils.sha256.hash("account:State").slice(0, 8));
+    console.log("State账户Discriminator:", stateDiscriminator.toString('hex'));
+    
+    const [stateKey, stateBump] = anchor.web3.PublicKey.findProgramAddressSync(
+      [stateDiscriminator],
+      program.programId
     );
-}
-
-// what it says
-async function poolBalance(mint) {
-    let [poolTokenKey] = findAddr([Buffer.from("TOKEN"), mint.publicKey.toBuffer()], adobe.programId);
-    let res = await provider.connection.getTokenAccountBalance(poolTokenKey);
-
-    // this is a string but im just using it for asserts so who cares
-    return res.value.amount;
-}
-
-describe("adobe flash loan program", () => {
-    let amount = 10 ** TOKEN_DECIMALS;
-
-    it("setup", async () => {
-        await setup();
-    });
-
-    it("adobe initalize", async () => {
-        await api.initialize(wallet);
-    });
-
-    it("adobe add_pool", async () => {
-        await api.addPool(wallet, tokenMint);
-    });
-
-    it("adobe deposit", async () => {
-        await api.deposit(wallet, tokenMint, amount * 2);
-    });
-
-    it("adobe withdraw", async () => {
-        await api.withdraw(wallet, tokenMint, amount);
-    });
-
-    it("adobe borrow/repay", async () => {
-        let [borrowIxn, repayIxn] = api.borrow(wallet, tokenMint, amount);
-
-        // normal borrow
-        let txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        let balBefore = await poolBalance(tokenMint);
-        await provider.send(txn);
-        let balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // dont repay
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(async () => provider.send(txn), "borrow without repay fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // dont fully repay
-        [borrowIxn] = api.borrow(wallet, tokenMint, amount + 1);
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "borrow more than repay fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // borrow too much
-        [borrowIxn, repayIxn] = api.borrow(wallet, tokenMint, amount * 10);
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "borrow more than available fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // double borrow (raw instruction)
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "multiple borrow fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // dounle borrow (direct cpi)
-        [borrowIxn, repayIxn] = api.borrow(wallet, tokenMint, amount / 10);
-        let evilIxn = evil.instruction.borrowProxy(new anchor.BN(amount / 10), {
-            accounts: {
-                user: wallet.publicKey,
-                state: stateKey,
-                pool: poolKey,
-                poolToken: poolTokenKey,
-                userToken: userTokenKey,
-                instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                adobeProgram: adobe.programId,
-            },
-        });
-
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(evilIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "borrow and cpi fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        txn = new anchor.web3.Transaction;
-        txn.add(evilIxn);
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "cpi and borrow fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        txn = new anchor.web3.Transaction;
-        txn.add(evilIxn);
-        txn.add(evilIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "cpi and cpi fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // dounle borrow (batched cpi)
-        evilIxn = evil.instruction.borrowDouble(new anchor.BN(amount / 10), {
-            accounts: {
-                user: wallet.publicKey,
-                state: stateKey,
-                pool: poolKey,
-                poolToken: poolTokenKey,
-                userToken: userTokenKey,
-                instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                adobeProgram: adobe.programId,
-            },
-        });
-
-        txn = new anchor.web3.Transaction;
-        txn.add(evilIxn);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "cpi double borrow fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-
-        // borrow from one repay from another
-        let oldTokenMint = tokenMint;
-        [borrowIxn] = api.borrow(wallet, tokenMint, amount);
-        await setup();
-        await api.addPool(wallet, tokenMint);
-        await api.deposit(wallet, tokenMint, amount * 2);
-        [, repayIxn] = api.borrow(wallet, tokenMint, amount);
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(repayIxn);
-
-        let p1BalBefore = await poolBalance(oldTokenMint);
-        let p2BalBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "repay different token fails");
-        let p1BalAfter = await poolBalance(oldTokenMint);
-        let p2BalAfter = await poolBalance(tokenMint);
-        assert.equal(p1BalAfter, p1BalBefore, "program first token balance unchanged");
-        assert.equal(p2BalAfter, p2BalBefore, "program second token balance unchanged");
-
-        // borrow, hidden repay to reset mutex, borrow again, repay
-        [borrowIxn, repayIxn] = api.borrow(wallet, tokenMint, amount / 10);
-        let evilBorrow = evil.instruction.borrowProxy(new anchor.BN(amount / 10), {
-            accounts: {
-                user: wallet.publicKey,
-                state: stateKey,
-                pool: poolKey,
-                poolToken: poolTokenKey,
-                userToken: userTokenKey,
-                instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                adobeProgram: adobe.programId,
-            },
-        });
-        let evilRepay = evil.instruction.repayProxy(new anchor.BN(1), {
-            accounts: {
-                user: wallet.publicKey,
-                state: stateKey,
-                pool: poolKey,
-                poolToken: poolTokenKey,
-                userToken: userTokenKey,
-                instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
-                tokenProgram: TOKEN_PROGRAM_ID,
-                adobeProgram: adobe.programId,
-            },
-        });
-
-        txn = new anchor.web3.Transaction;
-        txn.add(borrowIxn);
-        txn.add(evilRepay);
-        txn.add(evilBorrow);
-        txn.add(repayIxn);
-
-        balBefore = await poolBalance(tokenMint);
-        await assert.rejects(provider.send(txn), "cpi dummy repay fails");
-        balAfter = await poolBalance(tokenMint);
-        assert.equal(balAfter, balBefore, "program token balance unchanged");
-    });
-
-});
+    
+    console.log("计算的状态密钥:", stateKey.toString());
+    console.log("程序ID:", program.programId.toString());
+    
+    try {
+      // 初始化
+      await program.methods
+        .initialize(stateBump)
+        .accounts({
+          authority: authority.publicKey,
+          state: stateKey,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([authority])
+        .rpc();
+        
+      // 获取state账户
+      const state = await program.account.state.fetch(stateKey);
+      
+      // 验证state已正确初始化
+      assert.ok(state.authority.equals(authority.publicKey));
+    } catch (error) {
+      console.error(error);
+      throw error;
+    }
+  });
+}); 

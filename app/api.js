@@ -1,13 +1,33 @@
-import anchor from "@project-serum/anchor";
-import spl from "@solana/spl-token";
+import anchor from "@coral-xyz/anchor";
+import { 
+    TOKEN_PROGRAM_ID, 
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    createApproveInstruction,
+    createAssociatedTokenAccountInstruction
+} from "@solana/spl-token";
 import { findAddr, findAssocAddr, discriminator } from "../app/util.js";
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
 const LAMPORTS_PER_SOL = anchor.web3.LAMPORTS_PER_SOL;
 const SYSVAR_INSTRUCTIONS_PUBKEY = anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY;
-const TOKEN_PROGRAM_ID = spl.TOKEN_PROGRAM_ID;
-const ASSOCIATED_TOKEN_PROGRAM_ID = spl.ASSOCIATED_TOKEN_PROGRAM_ID;
 
-const adobe = anchor.workspace.Adobe;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// 获取provider
+const provider = anchor.getProvider();
+
+// 使用程序ID
+const adobeProgramId = new anchor.web3.PublicKey("VzRKfyFWHZtYWbQWfcnCGBrTg3tqqRV2weUqvrvVhuo");
+
+// 从文件读取IDL (不使用硬编码备选)
+const idlPath = join(dirname(__dirname), 'target', 'idl', 'adobe.json');
+console.log("尝试从路径加载IDL:", idlPath);
+const idlFile = readFileSync(idlPath, 'utf8');
+const idl = JSON.parse(idlFile);
+const adobe = new anchor.Program(idl, adobeProgramId, provider);
 
 let [stateKey, stateBump] = findAddr([discriminator("State")], adobe.programId);
 
@@ -63,24 +83,24 @@ async function deposit(user, mint, amount) {
 
     // create the voucher account for user if it doesnt exist
     if(!await anchor.getProvider().connection.getAccountInfo(userVoucherKey)) {
-        ixns.push(spl.Token.createAssociatedTokenAccountInstruction(
-            ASSOCIATED_TOKEN_PROGRAM_ID,
-            TOKEN_PROGRAM_ID,
-            voucherMintKey,
+        ixns.push(createAssociatedTokenAccountInstruction(
+            user.publicKey,
             userVoucherKey,
             user.publicKey,
-            user.publicKey,
+            voucherMintKey,
+            TOKEN_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
         ));
     }
 
     // approve a token transfer to avoid requiring the wallet
-    ixns.push(spl.Token.createApproveInstruction(
-        TOKEN_PROGRAM_ID,
+    ixns.push(createApproveInstruction(
         userTokenKey,
         stateKey,
         user.publicKey,
-        [],
         amount,
+        [],
+        TOKEN_PROGRAM_ID
     ));
 
     return adobe.rpc.deposit(new anchor.BN(amount), {
@@ -116,13 +136,13 @@ function withdraw(user, mint, amount) {
         },
         signers: [user.payer],
         instructions: [
-            spl.Token.createApproveInstruction(
-                TOKEN_PROGRAM_ID,
+            createApproveInstruction(
                 userVoucherKey,
                 stateKey,
                 user.publicKey,
-                [],
                 amount,
+                [],
+                TOKEN_PROGRAM_ID
             ),
         ],
     });
