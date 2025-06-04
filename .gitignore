@@ -3,3 +3,7 @@
 .anchor/
 target/
 node_modules/
+
+README.md
+solana-flashloan-1.md
+solana-flashloan-2.md
