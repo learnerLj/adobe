@@ -22,6 +22,7 @@ pub mod adobe {
 
         ctx.accounts.state.bump = state_bump;
         ctx.accounts.state.authority = ctx.accounts.authority.key();
+        ctx.accounts.state.fee_bps = 30; // Default 0.3% fee
 
         Ok(())
     }
@@ -36,6 +37,7 @@ pub mod adobe {
         ctx.accounts.pool.token_mint = ctx.accounts.token_mint.key();
         ctx.accounts.pool.pool_token = ctx.accounts.pool_token.key();
         ctx.accounts.pool.voucher_mint = ctx.accounts.voucher_mint.key();
+        ctx.accounts.pool.fee_bps = ctx.accounts.state.fee_bps; // Copy fee from state
 
         Ok(())
     }
@@ -170,7 +172,7 @@ pub mod adobe {
     }
 
     // REPAY
-    // receives tokens
+    // receives tokens with fee
     pub fn repay(ctx: Context<Repay>, amount: u64) -> Result<()> {
         msg!("adobe repay");
 
@@ -185,6 +187,11 @@ pub mod adobe {
             return Err(AdobeError::CpiRepay.into());
         }
 
+        // Calculate fee
+        let fee_bps = ctx.accounts.pool.fee_bps as u64;
+        let fee_amount = amount.checked_mul(fee_bps).unwrap().checked_div(10000).unwrap();
+        let total_repay = amount.checked_add(fee_amount).unwrap();
+
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -194,11 +201,33 @@ pub mod adobe {
             },
         );
 
-        token::transfer(transfer_ctx, amount)?;
+        token::transfer(transfer_ctx, total_repay)?;
         ctx.accounts.pool.borrowing = false;
 
         Ok(())
     }
+
+    // SET FEE
+    // allows authority to update the fee
+    pub fn set_fee(ctx: Context<SetFee>, fee_bps: u16) -> Result<()> {
+        msg!("adobe set_fee");
+
+        ctx.accounts.state.fee_bps = fee_bps;
+        
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct SetFee<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [&State::DISCRIMINATOR[..]],
+        bump = state.bump,
+        has_one = authority,
+    )]
+    pub state: Account<'info, State>,
 }
 
 #[derive(Accounts)]
@@ -211,7 +240,7 @@ pub struct Initialize<'info> {
         seeds = [&State::DISCRIMINATOR[..]],
         bump,
         payer = authority,
-        space = 8 + 1 + 32, // 8 discriminator + 1 bump + 32 authority pubkey
+        space = 8 + 1 + 32 + 2, // 8 discriminator + 1 bump + 32 authority pubkey + 2 fee_bps
     )]
     pub state: Account<'info, State>,
     pub rent: Sysvar<'info, Rent>,
@@ -235,7 +264,7 @@ pub struct AddPool<'info> {
         seeds = [&Pool::DISCRIMINATOR[..], token_mint.key().as_ref()],
         bump,
         payer = authority,
-        space = 8 + 1 + 1 + 32 + 32 + 32, // 8 discriminator + 1 bump + 1 borrowing + 3 pubkeys
+        space = 8 + 1 + 1 + 32 + 32 + 32 + 2, // 8 discriminator + 1 bump + 1 borrowing + 3 pubkeys + 2 fee_bps
     )]
     pub pool: Account<'info, Pool>,
     #[account(
@@ -335,6 +364,7 @@ pub struct Repay<'info> {
 pub struct State {
     bump: u8,
     authority: Pubkey,
+    fee_bps: u16, // Fee in basis points (0.01%)
 }
 
 #[account]
@@ -345,6 +375,7 @@ pub struct Pool {
     token_mint: Pubkey,
     pool_token: Pubkey,
     voucher_mint: Pubkey,
+    fee_bps: u16, // Fee in basis points (0.01%)
 }
 
 #[error_code]
